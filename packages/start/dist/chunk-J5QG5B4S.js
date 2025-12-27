@@ -1,0 +1,210 @@
+#!/usr/bin/env node
+
+// src/electric-api.ts
+var DEFAULT_ELECTRIC_API_BASE = `https://dashboard.electric-sql.cloud/api`;
+var DEFAULT_ELECTRIC_URL = `https://api.electric-sql.cloud`;
+var DEFAULT_ELECTRIC_DASHBOARD_URL = `https://dashboard.electric-sql.cloud`;
+function getElectricApiBase() {
+  return process.env.ELECTRIC_API_BASE_URL ?? DEFAULT_ELECTRIC_API_BASE;
+}
+function getElectricUrl() {
+  return process.env.ELECTRIC_URL ?? DEFAULT_ELECTRIC_URL;
+}
+function getElectricDashboardUrl() {
+  return process.env.ELECTRIC_DASHBOARD_URL ?? DEFAULT_ELECTRIC_DASHBOARD_URL;
+}
+var POLL_INTERVAL_MS = 1e3;
+var MAX_POLL_ATTEMPTS = 60;
+async function pollClaimableSource(claimId, maxAttempts = MAX_POLL_ATTEMPTS) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const response = await fetch(
+      `${getElectricApiBase()}/public/v1/claimable-sources/${claimId}`,
+      {
+        method: `GET`,
+        headers: {
+          "User-Agent": `@electric-sql/start`
+        }
+      }
+    );
+    if (response.status === 404) {
+      await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+      continue;
+    }
+    if (!response.ok) {
+      throw new Error(
+        `Electric API error: ${response.status} ${response.statusText}`
+      );
+    }
+    const status = await response.json();
+    if (status.state === `ready`) {
+      return status;
+    }
+    if (status.state === `failed` || status.error) {
+      throw new Error(
+        `Resource provisioning failed${status.error ? `: ${status.error}` : ``}`
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+  }
+  throw new Error(
+    `Timeout waiting for resources to be provisioned after ${maxAttempts} attempts`
+  );
+}
+async function provisionElectricResources() {
+  console.log(`Provisioning resources...`);
+  try {
+    const response = await fetch(
+      `${getElectricApiBase()}/public/v1/claimable-sources`,
+      {
+        method: `POST`,
+        headers: {
+          "Content-Type": `application/json`,
+          "User-Agent": `@electric-sql/start`
+        },
+        body: JSON.stringify({})
+      }
+    );
+    if (!response.ok) {
+      throw new Error(
+        `Electric API error: ${response.status} ${response.statusText}`
+      );
+    }
+    const { claimId } = await response.json();
+    if (!claimId) {
+      throw new Error(`Invalid response from Electric API - missing claimId`);
+    }
+    const status = await pollClaimableSource(claimId);
+    if (!status.source?.source_id || !status.source?.secret || !status.connection_uri) {
+      throw new Error(
+        `Invalid response from Electric API - missing required credentials`
+      );
+    }
+    return {
+      source_id: status.source.source_id,
+      secret: status.source.secret,
+      DATABASE_URL: status.connection_uri,
+      claimId
+    };
+  } catch (error) {
+    if (error instanceof Error) {
+      throw new Error(
+        `Failed to provision Electric resources: ${error.message}`
+      );
+    }
+    throw new Error(`Failed to provision Electric resources: Unknown error`);
+  }
+}
+async function claimResources(sourceId, secret) {
+  try {
+    const response = await fetch(`${getElectricApiBase()}/v1/claim`, {
+      method: `POST`,
+      headers: {
+        "Content-Type": `application/json`,
+        Authorization: `Bearer ${secret}`,
+        "User-Agent": `@electric-sql/start`
+      },
+      body: JSON.stringify({
+        source_id: sourceId
+      })
+    });
+    if (!response.ok) {
+      throw new Error(
+        `Electric API error: ${response.status} ${response.statusText}`
+      );
+    }
+    const result = await response.json();
+    if (!result.claimUrl) {
+      throw new Error(`Invalid response from Electric API - missing claim URL`);
+    }
+    return result;
+  } catch (error) {
+    if (error instanceof Error) {
+      throw new Error(`Failed to initiate resource claim: ${error.message}`);
+    }
+    throw new Error(`Failed to initiate resource claim: Unknown error`);
+  }
+}
+
+// src/template-setup.ts
+import { execSync } from "child_process";
+import { randomBytes } from "crypto";
+import { writeFileSync, readFileSync, existsSync } from "fs";
+import { join } from "path";
+function generateSecret(length = 32) {
+  return randomBytes(length).toString(`hex`);
+}
+async function setupTemplate(appName, credentials) {
+  const appPath = appName === `.` ? process.cwd() : join(process.cwd(), appName);
+  try {
+    if (appName !== `.`) {
+      console.log(`Pulling template...`);
+      execSync(
+        `npx gitpick electric-sql/electric/tree/main/examples/tanstack-db-web-starter ${appName}`,
+        { stdio: `inherit` }
+      );
+    }
+    console.log(`Configuring environment...`);
+    const betterAuthSecret = generateSecret(32);
+    const electricUrl = getElectricUrl();
+    const envContent = `# Electric SQL Configuration
+# Generated by @electric-sql/start
+# DO NOT COMMIT THIS FILE
+
+# Database
+DATABASE_URL=${credentials.DATABASE_URL}
+
+# Electric Cloud
+ELECTRIC_URL=${electricUrl}
+ELECTRIC_SOURCE_ID=${credentials.source_id}
+ELECTRIC_SECRET=${credentials.secret}
+
+# Authentication
+BETTER_AUTH_SECRET=${betterAuthSecret}
+`;
+    writeFileSync(join(appPath, `.env`), envContent);
+    console.log(`Updating .gitignore...`);
+    const gitignorePath = join(appPath, `.gitignore`);
+    let gitignoreContent = ``;
+    if (existsSync(gitignorePath)) {
+      gitignoreContent = readFileSync(gitignorePath, `utf8`);
+    }
+    if (!gitignoreContent.includes(`.env`)) {
+      gitignoreContent += `
+# Environment variables
+.env
+.env.local
+.env.*.local
+`;
+      writeFileSync(gitignorePath, gitignoreContent);
+    }
+    console.log(`Adding Electric commands...`);
+    const packageJsonPath = join(appPath, `package.json`);
+    if (existsSync(packageJsonPath)) {
+      const packageJson = JSON.parse(readFileSync(packageJsonPath, `utf8`));
+      packageJson.scripts = {
+        ...packageJson.scripts,
+        claim: `npx open-cli "${getElectricDashboardUrl()}/claim?uuid=${credentials.claimId}"`,
+        "deploy:netlify": `NODE_ENV=production NITRO_PRESET=netlify pnpm build && NODE_ENV=production npx netlify deploy --no-build --prod --dir=dist --functions=.netlify/functions-internal && npx netlify env:import .env`
+      };
+      writeFileSync(packageJsonPath, JSON.stringify(packageJson, null, 2));
+    }
+    console.log(`Template setup complete`);
+  } catch (error) {
+    throw new Error(
+      `Template setup failed: ${error instanceof Error ? error.message : error}`
+    );
+  }
+}
+
+export {
+  DEFAULT_ELECTRIC_API_BASE,
+  DEFAULT_ELECTRIC_URL,
+  DEFAULT_ELECTRIC_DASHBOARD_URL,
+  getElectricApiBase,
+  getElectricUrl,
+  getElectricDashboardUrl,
+  provisionElectricResources,
+  claimResources,
+  setupTemplate
+};
+//# sourceMappingURL=chunk-J5QG5B4S.js.map
